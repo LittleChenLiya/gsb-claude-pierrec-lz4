@@ -40,6 +40,13 @@ issue43.data, issue51.data, issue102.data
     Where they came from is not recorded.
 malformed.block.lz4
     A frame with a corrupt block.
+frame_twoblock.lz4
+    A legal 64KiB-block frame of 65543 bytes spanning exactly two blocks,
+    with an accurate declared content size. Used by TestReaderVerifyContentSize.
+frame_size_5_actual_4.lz4
+    A complete end frame whose descriptor declares a content size of 5 bytes
+    but whose single block contains only 4 ("abcd"). Used by
+    TestReaderVerifyContentSize.
 compress.golden, ccompat.golden
     Digests of this package's and of lz4 1.10.0's compressed output.
 silesia.tar

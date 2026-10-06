@@ -309,6 +309,24 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 	}
 }
 
+// VerifyContentSize strictly validates the current frame's declared content
+// size. It reads and discards the frame through its end mark, accumulating the
+// actual uncompressed size across every block read, and compares it with the
+// size declared in the frame descriptor when the end mark is reached. A frame
+// without a declared content size verifies successfully.
+//
+// The check is performed only at a completed end mark: a source that ends
+// before the frame is complete is reported as io.ErrUnexpectedEOF rather than
+// accepted as a complete frame. It returns the number of uncompressed bytes
+// the frame contained.
+//
+// The regular Read and WriteTo interfaces are unchanged; this is a dedicated
+// strict-length entry point for callers that need to validate a whole frame
+// without retaining its data.
+func (r *Reader) VerifyContentSize() (n int64, err error) {
+	return r.WriteTo(io.Discard)
+}
+
 // ValidFrameHeader returns a bool indicating if the given bytes slice matches a LZ4 header.
 func ValidFrameHeader(in []byte) (bool, error) {
 	f := lz4stream.NewFrame()

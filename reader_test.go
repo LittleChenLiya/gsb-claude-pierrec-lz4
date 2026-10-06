@@ -696,3 +696,128 @@ func TestReaderConcurrentResetMidStream(t *testing.T) {
 		t.Fatal("output mismatch after resets")
 	}
 }
+
+// TestReaderVerifyContentSize exercises the strict frame length entry point
+// against the two small fixtures in testdata:
+//   - frame_size_5_actual_4.lz4 declares a content size of 5 bytes but its
+//     complete end frame contains only 4, so it must be rejected.
+//   - frame_twoblock.lz4 is a legal frame whose content spans exactly two
+//     blocks with an accurate declared content size, so it must verify.
+func TestReaderVerifyContentSize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		conc int
+	}{
+		{"sequential", 1},
+		{"concurrent", 4},
+	} {
+		t.Run(tc.name+"/declared5Actual4", func(t *testing.T) {
+			in, err := os.ReadFile("testdata/frame_size_5_actual_4.lz4")
+			if err != nil {
+				t.Fatal(err)
+			}
+			zr := lz4.NewReader(bytes.NewReader(in))
+			if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+				t.Fatal(err)
+			}
+			// The four payload bytes are delivered, but the completed frame
+			// fails the declared-length check at its end mark.
+			n, err := zr.VerifyContentSize()
+			if !errors.Is(err, lz4.ErrInvalidContentSize) {
+				t.Fatalf("got n=%d err=%v; want ErrInvalidContentSize", n, err)
+			}
+			if n != 4 {
+				t.Errorf("got n=%d; want 4 actual bytes", n)
+			}
+
+			// The regular read interface reports the same strict failure.
+			zr = lz4.NewReader(bytes.NewReader(in))
+			if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+				t.Fatal(err)
+			}
+			out, err := io.ReadAll(zr)
+			if !errors.Is(err, lz4.ErrInvalidContentSize) {
+				t.Fatalf("Read got %v; want ErrInvalidContentSize", err)
+			}
+			if string(out) != "abcd" {
+				t.Errorf("Read payload = %q; want abcd", out)
+			}
+		})
+
+		t.Run(tc.name+"/twoBlocks", func(t *testing.T) {
+			in, err := os.ReadFile("testdata/frame_twoblock.lz4")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const wantSize = 64*1024 + 7 // two blocks: a full 64KiB block and 7 bytes
+			zr := lz4.NewReader(bytes.NewReader(in))
+			if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+				t.Fatal(err)
+			}
+			n, err := zr.VerifyContentSize()
+			if err != nil {
+				t.Fatalf("VerifyContentSize: %v", err)
+			}
+			if n != wantSize {
+				t.Errorf("got n=%d; want %d", n, wantSize)
+			}
+
+			// The strict entry must leave the frame fully consumed: a second
+			// verification on the exhausted source sees an empty stream.
+			n2, err := zr.VerifyContentSize()
+			if err != nil {
+				t.Fatalf("second VerifyContentSize: %v", err)
+			}
+			if n2 != 0 {
+				t.Errorf("second verification got n=%d; want 0", n2)
+			}
+
+			// The regular read interface still reads the legal frame whole.
+			zr = lz4.NewReader(bytes.NewReader(in))
+			if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+				t.Fatal(err)
+			}
+			out, err := io.ReadAll(zr)
+			if err != nil {
+				t.Fatalf("ReadAll: %v", err)
+			}
+			if len(out) != wantSize {
+				t.Fatalf("ReadAll got %d bytes; want %d", len(out), wantSize)
+			}
+			prefix := bytes.Repeat([]byte("A"), 64*1024)
+			if !bytes.HasPrefix(out, prefix) || string(out[64*1024:]) != "hello!!" {
+				t.Fatal("two-block payload mismatch")
+			}
+		})
+
+		t.Run(tc.name+"/earlyEOF", func(t *testing.T) {
+			in, err := os.ReadFile("testdata/frame_twoblock.lz4")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Cut at several points: all leave a frame whose end mark never
+			// arrives, so none must be reported as a complete frame.
+			for _, cut := range []int{1, 4, 9, 64, 200} {
+				if cut >= len(in) {
+					continue
+				}
+				trunc := in[:len(in)-cut]
+				zr := lz4.NewReader(bytes.NewReader(trunc))
+				if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := zr.VerifyContentSize(); !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Errorf("VerifyContentSize cut=%d got %v; want ErrUnexpectedEOF", cut, err)
+				}
+
+				zr = lz4.NewReader(bytes.NewReader(trunc))
+				if err := zr.Apply(lz4.ConcurrencyOption(tc.conc)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, zr); !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Errorf("Read cut=%d got %v; want ErrUnexpectedEOF", cut, err)
+				}
+			}
+		})
+	}
+}
