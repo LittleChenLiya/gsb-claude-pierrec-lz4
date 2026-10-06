@@ -223,6 +223,13 @@ func (b *Blocks) initR(f *Frame, num int, src io.Reader) (chan []byte, error) {
 				_, _ = f.checksum.Write(buf)
 			}
 			f.size += uint64(len(buf))
+			if err := f.checkSize(); err != nil {
+				r.fail(err)
+				lz4block.Put(buf)
+				close(c)
+				skipBlocks = true
+				continue
+			}
 			if leg {
 				cum += uint32(len(buf))
 			}
@@ -417,6 +424,9 @@ func (b *FrameDataBlock) Uncompress(f *Frame, dst, dict []byte, sum bool) ([]byt
 			_, _ = f.checksum.Write(dst)
 		}
 		f.size += uint64(len(dst))
+		if err := f.checkSize(); err != nil {
+			return nil, err
+		}
 	}
 	return dst, nil
 }

@@ -31,6 +31,25 @@ type Frame struct {
 	Checksum   uint32
 	checksum   xxh32.XXHZero
 	size       uint64 // uncompressed bytes read or written so far, checked against Descriptor.ContentSize
+	strict     bool   // check the decoded content size as it accumulates, not only at the end mark
+}
+
+// SetStrict enables strict content size validation on reads: the decoded
+// size is checked against the content size declared in the descriptor as
+// it accumulates across blocks, so a frame that decodes to more than its
+// declared size is rejected before its end mark. The final count is
+// checked at the end mark by CloseR whether or not strict mode is on.
+func (f *Frame) SetStrict(strict bool) {
+	f.strict = strict
+}
+
+// checkSize reports a decoded content size that exceeds the declared one.
+// It only runs in strict mode; CloseR checks the final count in all modes.
+func (f *Frame) checkSize() error {
+	if f.strict && f.Descriptor.Flags.Size() && f.size > f.Descriptor.ContentSize {
+		return fmt.Errorf("%w: got more than %d bytes", lz4errors.ErrInvalidContentSize, f.Descriptor.ContentSize)
+	}
+	return nil
 }
 
 // unexpectedEOF is for reads that must not hit the end of the source,

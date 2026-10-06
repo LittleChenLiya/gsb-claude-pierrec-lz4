@@ -22,6 +22,19 @@ func NewReader(r io.Reader) *Reader {
 	return newReader(r, false)
 }
 
+// NewReaderStrict returns a new LZ4 frame decoder that strictly validates
+// the content size declared in each frame's descriptor against the bytes
+// actually decoded: the decoded size is accumulated across blocks and a
+// frame that decodes to more than its declared size is rejected as soon as
+// the excess is seen, a frame whose end mark does not match the declared
+// size is rejected, and a source that ends before the frame's end mark is
+// reported as io.ErrUnexpectedEOF rather than a clean io.EOF.
+func NewReaderStrict(r io.Reader) *Reader {
+	zr := newReader(r, false)
+	zr.frame.SetStrict(true)
+	return zr
+}
+
 func newReader(r io.Reader, legacy bool) *Reader {
 	zr := &Reader{frame: lz4stream.NewFrame()}
 	zr.state.init(readerStates)

@@ -696,3 +696,84 @@ func TestReaderConcurrentResetMidStream(t *testing.T) {
 		t.Fatal("output mismatch after resets")
 	}
 }
+
+// The strict reader validates the declared content size against the bytes
+// actually decoded, accumulating the size across blocks: a frame whose end
+// mark does not match the declared size is rejected, an oversized frame
+// fails as soon as the excess is decoded, and a stream that ends before
+// the end mark is incomplete, never a clean EOF.
+func TestReaderStrictContentSize(t *testing.T) {
+	// Small hand-built frames with a declared content size and stored
+	// (uncompressed) blocks:
+	//   strict_size_short.lz4  declares 5 bytes, its only block holds 4
+	//   strict_two_blocks.lz4  declares 8 bytes over two blocks
+	readFixture := func(name string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	short := readFixture("testdata/strict_size_short.lz4")
+	twoBlocks := readFixture("testdata/strict_two_blocks.lz4")
+	const twoBlocksData = "hello, w"
+
+	newStrict := func(in []byte, conc int) *lz4.Reader {
+		t.Helper()
+		zr := lz4.NewReaderStrict(bytes.NewReader(in))
+		if err := zr.Apply(lz4.ConcurrencyOption(conc)); err != nil {
+			t.Fatal(err)
+		}
+		return zr
+	}
+
+	for _, conc := range []int{1, 4} {
+		t.Run(fmt.Sprintf("conc%d", conc), func(t *testing.T) {
+			t.Run("shortContentRejected", func(t *testing.T) {
+				out, err := io.ReadAll(newStrict(short, conc))
+				if !errors.Is(err, lz4.ErrInvalidContentSize) {
+					t.Fatalf("got %q, %v; want ErrInvalidContentSize", out, err)
+				}
+			})
+			t.Run("twoBlocks", func(t *testing.T) {
+				out, err := io.ReadAll(newStrict(twoBlocks, conc))
+				if err != nil || string(out) != twoBlocksData {
+					t.Fatalf("got %q, %v", out, err)
+				}
+			})
+			t.Run("earlyEOF", func(t *testing.T) {
+				// The stream stops right after the block data: no end mark.
+				out, err := io.ReadAll(newStrict(twoBlocks[:len(twoBlocks)-4], conc))
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("got %q, %v; want io.ErrUnexpectedEOF", out, err)
+				}
+			})
+			t.Run("oversizeFailsBeforeEndMark", func(t *testing.T) {
+				// Declares 4 bytes; the first block alone decodes to 8, so
+				// the frame must fail before its end mark, delivering no
+				// more than the declared size.
+				frame := cat(magic,
+					desc(flgV1|flgIndep|flgSize, bd64K, le64(4)...),
+					rawBlock([]byte(twoBlocksData)),
+					endMark)
+				out, err := io.ReadAll(newStrict(frame, conc))
+				if !errors.Is(err, lz4.ErrInvalidContentSize) {
+					t.Fatalf("got %q, %v; want ErrInvalidContentSize", out, err)
+				}
+				if len(out) > 4 {
+					t.Fatalf("decoded %d bytes, more than the declared 4", len(out))
+				}
+			})
+		})
+	}
+
+	// The plain reader interface is unchanged: it still decodes a
+	// well-formed frame.
+	t.Run("plainReaderUnchanged", func(t *testing.T) {
+		out, err := io.ReadAll(lz4.NewReader(bytes.NewReader(twoBlocks)))
+		if err != nil || string(out) != twoBlocksData {
+			t.Fatalf("got %q, %v", out, err)
+		}
+	})
+}
