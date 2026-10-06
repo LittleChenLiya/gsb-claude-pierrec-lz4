@@ -4,6 +4,7 @@ package lz4block
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -27,6 +28,18 @@ var (
 
 	blockPoolLegacy = sync.Pool{New: func() any { return &[legacyBlockBound]byte{} }}
 )
+
+// Pool operation counters. They allow tests and resource audits to verify
+// that every buffer borrowed from a pool is returned exactly once: after a
+// session (including a canceled one) has fully wound down, GetCount and
+// PutCount must have increased by the same amount.
+var poolGets, poolPuts atomic.Int64
+
+// GetCount returns the number of buffers borrowed from the pools so far.
+func GetCount() int64 { return poolGets.Load() }
+
+// PutCount returns the number of buffers returned to the pools so far.
+func PutCount() int64 { return poolPuts.Load() }
 
 func Index(b uint32) BlockSizeIndex {
 	switch b {
@@ -59,6 +72,7 @@ func (b BlockSizeIndex) IsValid() bool {
 }
 
 func (b BlockSizeIndex) Get() []byte {
+	poolGets.Add(1)
 	switch b {
 	case 4:
 		return blockPool64K.Get().(*[Block64Kb]byte)[:]
@@ -77,6 +91,7 @@ func (b BlockSizeIndex) Get() []byte {
 
 // GetLegacy returns a buffer for one compressed legacy block.
 func GetLegacy() []byte {
+	poolGets.Add(1)
 	return blockPoolLegacy.Get().(*[legacyBlockBound]byte)[:]
 }
 
@@ -97,9 +112,11 @@ func Put(buf []byte) {
 		blockPoolLegacy.Put((*[legacyBlockBound]byte)(buf[:c]))
 	case 0:
 		// Allow "returning" an empty buffer.
+		return
 	default:
 		panic(fmt.Errorf("invalid block size %d", c))
 	}
+	poolPuts.Add(1)
 }
 
 type CompressionLevel uint32

@@ -16,6 +16,12 @@ type Blocks struct {
 	Blocks chan chan *FrameDataBlock
 	reader *asyncReader // in flight if concurrency > 1, nil otherwise
 	err    error
+	// cancelW is closed when the write session is explicitly canceled: the
+	// collection goroutine keeps draining the queued block channels (so
+	// every compression goroutine can return its buffers to the pool
+	// exactly once) but stops writing their results to the destination.
+	// A channel is used so that Frame stays copyable (see asyncReader).
+	cancelW chan struct{}
 }
 
 // asyncReader reads one frame with concurrency > 1. A Reset can
@@ -60,9 +66,11 @@ func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 		return
 	}
 	b.Block = nil
+	b.cancelW = make(chan struct{})
 	if cap(b.Blocks) != num {
 		b.Blocks = make(chan chan *FrameDataBlock, num)
 	}
+	cancelW := b.cancelW
 	// goroutine managing concurrent block compression goroutines.
 	go func() {
 		// Process next block compression item.
@@ -78,13 +86,19 @@ func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 				close(c)
 				return
 			}
-			// Do not attempt to write the block upon any previous failure.
-			if b.err == nil {
-				// Write the block.
-				if err := block.Write(f, dst); err != nil {
-					// Keep the first error.
-					b.err = err
-					// All pending compression goroutines need to shut down, so we need to keep going.
+			// Do not attempt to write the block upon any previous failure,
+			// nor once the session has been canceled: late compression
+			// results are dropped, never written out.
+			select {
+			case <-cancelW:
+			default:
+				if b.err == nil {
+					// Write the block.
+					if err := block.Write(f, dst); err != nil {
+						// Keep the first error.
+						b.err = err
+						// All pending compression goroutines need to shut down, so we need to keep going.
+					}
 				}
 			}
 			close(c)
@@ -113,6 +127,62 @@ func (b *Blocks) close(f *Frame, num int) error {
 		b.err = nil
 		return err
 	}
+	c := make(chan *FrameDataBlock)
+	b.Blocks <- c
+	c <- nil
+	<-c
+	b.Blocks = nil // ensure a second close from Reset does not block
+	err := b.err
+	b.err = nil
+	return err
+}
+
+// stopW prevents any further block result from being written to the
+// destination: the collection goroutine keeps draining the queued block
+// channels (so every compression goroutine can return its buffers to the
+// pool exactly once) but drops their results. It is a no-op if the write
+// pipeline is not running, and is safe to call more than once.
+func (b *Blocks) stopW() {
+	if b.Blocks == nil {
+		return
+	}
+	select {
+	case <-b.cancelW: // already stopped
+	default:
+		close(b.cancelW)
+	}
+}
+
+// cancel shuts the write pipeline down without letting any further block
+// reach the destination: the frame being written is left without its end
+// mark, so the stream prefix produced so far stays visibly incomplete
+// instead of looking like a valid finished frame.
+//
+// Block compression goroutines that already hold pool buffers are drained
+// through the usual sentinel handshake: each of them returns its buffers to
+// the pool exactly once, whether its result is written, dropped because of
+// an earlier error, or dropped because of this cancellation. Results
+// delivered after cancel has been requested are never written out.
+//
+// The pools are shared with every other writer: cancel only returns the
+// buffers this session owns, it does not touch the pools themselves.
+func (b *Blocks) cancel(f *Frame, num int) error {
+	if num == 1 {
+		if b.Block != nil {
+			b.Block.Close(f)
+		}
+		err := b.err
+		b.err = nil
+		return err
+	}
+	if b.Blocks == nil {
+		err := b.err
+		b.err = nil
+		return err
+	}
+	// Reject late results before draining, so that no block still in
+	// flight is written once the drain below unblocks it.
+	b.stopW()
 	c := make(chan *FrameDataBlock)
 	b.Blocks <- c
 	c <- nil

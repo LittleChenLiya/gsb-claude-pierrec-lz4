@@ -200,6 +200,48 @@ func (w *Writer) Close() error {
 	return err
 }
 
+// Cancel aborts the current writing session without trying to finish the
+// frame: no more blocks are accepted, any buffered data is discarded, and
+// the frame end mark is not written. The stream prefix produced so far is
+// therefore left explicitly incomplete; readers will report an unexpected
+// end of stream rather than a valid frame.
+//
+// Block compressions already in flight are drained: each of them returns
+// the buffers it borrowed from the shared pools exactly once, whether it
+// succeeded or failed, and results delivered after the cancellation are
+// dropped instead of being written out. Only the buffers owned by this
+// session are returned; the shared pools themselves are left untouched, so
+// other writers are not affected.
+//
+// Cancel returns ErrWriterCanceled, unless the session had already failed,
+// in which case the original error is kept as the cause. The Writer is left
+// in its error state; call Reset to reuse it. Close is unaffected and keeps
+// its usual behavior for non-canceled sessions.
+func (w *Writer) Cancel() error {
+	switch w.state.state {
+	case closedState:
+		return nil
+	case errorState:
+		// Keep the original error.
+		return w.state.err
+	}
+	// Reject new blocks from now on.
+	w.state.next(lz4errors.ErrWriterCanceled)
+	// Drop late results: no block still in flight is written out.
+	w.frame.StopW()
+	// Discard the pending buffer: its data will never be flushed.
+	lz4block.Put(w.data)
+	w.data = nil
+	w.idx = 0
+	// Drain the pipeline and wait for every in-flight block to return its
+	// buffers to the pool.
+	if err := w.frame.CancelW(w.num); err != nil {
+		// The session had already failed: keep the original cause.
+		w.state.err = fmt.Errorf("%w: %w", lz4errors.ErrWriterCanceled, err)
+	}
+	return w.state.err
+}
+
 // Reset clears the state of the Writer w such that it is equivalent to its
 // initial state from NewWriter, but instead writing to writer.
 // Reset keeps the previous options unless overwritten by the supplied ones.

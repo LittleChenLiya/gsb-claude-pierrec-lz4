@@ -89,6 +89,23 @@ func (f *Frame) isLegacy() bool {
 	return f.Magic == frameMagicLegacy
 }
 
+// StopW prevents any further block of the frame being written from
+// reaching the destination: late compression results are dropped instead of
+// being written out. It only takes effect once the frame is being written
+// concurrently, and is safe to call more than once.
+func (f *Frame) StopW() {
+	f.Blocks.stopW()
+}
+
+// CancelW abandons the frame being written: the block pipeline is drained
+// like in CloseW, but the end mark is deliberately not written, leaving the
+// stream explicitly incomplete. In-flight block results are dropped and
+// their buffers are returned to the shared pools exactly once.
+func (f *Frame) CancelW(num int) error {
+	f.Blocks.stopW()
+	return f.Blocks.cancel(f, num)
+}
+
 // BlockSizeIndex returns the block size of the frame; legacy frames
 // have no descriptors and return 8Mb.
 func (f *Frame) BlockSizeIndex() lz4block.BlockSizeIndex {

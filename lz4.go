@@ -175,6 +175,9 @@ const (
 	ErrWriterNotClosed = lz4errors.ErrWriterNotClosed
 	// ErrWriterClosed is returned when writing to a closed writer.
 	ErrWriterClosed = lz4errors.ErrWriterClosed
+	// ErrWriterCanceled is returned by Writer.Cancel and by any write
+	// operation attempted after it.
+	ErrWriterCanceled = lz4errors.ErrWriterCanceled
 	// ErrInvalidFrameDescriptor is returned when reading a frame whose descriptor has an
 	// unknown version, reserved bits set, or a dictionary ID.
 	ErrInvalidFrameDescriptor = lz4errors.ErrInvalidFrameDescriptor
