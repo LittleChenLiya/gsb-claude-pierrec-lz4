@@ -16,6 +16,13 @@ type Blocks struct {
 	Blocks chan chan *FrameDataBlock
 	reader *asyncReader // in flight if concurrency > 1, nil otherwise
 	err    error
+	// cancelCh is closed by Cancel: the collection goroutine keeps
+	// collecting in-flight compressed blocks (so their buffers are
+	// released) but discards them instead of writing them to the
+	// destination. It is recreated by initW for each writing session and
+	// guarded by cmu, as Cancel may run concurrently with initW.
+	cmu      sync.Mutex
+	cancelCh chan struct{}
 }
 
 // asyncReader reads one frame with concurrency > 1. A Reset can
@@ -54,6 +61,10 @@ func (r *asyncReader) drain() {
 var errAbandoned = lz4errors.Error("lz4: concurrent read abandoned")
 
 func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
+	b.cmu.Lock()
+	cancelCh := make(chan struct{})
+	b.cancelCh = cancelCh
+	b.cmu.Unlock()
 	if num == 1 {
 		b.Blocks = nil
 		b.Block = b.Block.init(f)
@@ -78,8 +89,10 @@ func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 				close(c)
 				return
 			}
-			// Do not attempt to write the block upon any previous failure.
-			if b.err == nil {
+			// Do not attempt to write the block upon any previous failure,
+			// nor once the session has been canceled: late compression
+			// results are collected (releasing their buffers) but discarded.
+			if b.err == nil && !chanClosed(cancelCh) {
 				// Write the block.
 				if err := block.Write(f, dst); err != nil {
 					// Keep the first error.
@@ -90,6 +103,38 @@ func (b *Blocks) initW(f *Frame, dst io.Writer, num int) {
 			close(c)
 		}
 	}()
+}
+
+// Cancel flags the block collection as canceled: compressed blocks that
+// have not been written to the destination yet are discarded once they are
+// collected, so a canceled session never appends late results to the
+// committed prefix. The collection goroutine keeps running so that
+// in-flight compression routines can deliver their results and release
+// their buffers; Close terminates it as usual.
+func (b *Blocks) Cancel() {
+	b.cmu.Lock()
+	if b.cancelCh != nil {
+		close(b.cancelCh)
+		b.cancelCh = nil
+	}
+	b.cmu.Unlock()
+}
+
+// chanClosed reports whether ch is closed.
+func chanClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close waits for all in-flight blocks to be collected and releases the
+// resources held by the block collection, returning the first write error
+// encountered, if any. It is safe to call after Cancel.
+func (b *Blocks) Close(f *Frame, num int) error {
+	return b.close(f, num)
 }
 
 func (b *Blocks) close(f *Frame, num int) error {
