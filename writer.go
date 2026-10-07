@@ -28,15 +28,16 @@ func NewWriter(w io.Writer) *Writer {
 
 // Writer allows writing an LZ4 stream.
 type Writer struct {
-	state   _State
-	src     io.Writer                 // destination writer
-	level   lz4block.CompressionLevel // how hard to try
-	num     int                       // concurrency level
-	frame   *lz4stream.Frame          // frame being built
-	data    []byte                    // pending data
-	idx     int                       // size of pending data
-	handler func(int)
-	legacy  bool
+	state    _State
+	src      io.Writer                 // destination writer
+	level    lz4block.CompressionLevel // how hard to try
+	num      int                       // concurrency level
+	frame    *lz4stream.Frame          // frame being built
+	data     []byte                    // pending data
+	idx      int                       // size of pending data
+	handler  func(int)
+	legacy   bool
+	nwritten uint64 // uncompressed bytes accepted from Write and ReadFrom
 }
 
 func (*Writer) private() {}
@@ -63,6 +64,35 @@ func (w *Writer) isNotConcurrent() bool {
 	return w.num == 1
 }
 
+// contentSize returns the declared original content size and whether the
+// content size convention is in force. Legacy frames carry no descriptor and
+// do not support it.
+func (w *Writer) contentSize() (uint64, bool) {
+	if w.legacy {
+		return 0, false
+	}
+	return w.frame.Descriptor.ContentSize, w.frame.Descriptor.Flags.Size()
+}
+
+// limit truncates buf to the bytes still allowed by a declared content size.
+// It returns the (possibly shortened) slice and the number of rejected bytes.
+func (w *Writer) limit(buf []byte) ([]byte, int) {
+	declared, ok := w.contentSize()
+	if !ok {
+		// Size unknown: no limit.
+		return buf, 0
+	}
+	if w.nwritten >= declared {
+		// Declared amount already accepted: everything is rejected.
+		return buf[:0], len(buf)
+	}
+	remaining := declared - w.nwritten
+	if uint64(len(buf)) <= remaining {
+		return buf, 0
+	}
+	return buf[:remaining], int(uint64(len(buf)) - remaining)
+}
+
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
 	if !w.legacy && !w.frame.Descriptor.Flags.BlockSizeIndex().IsValid() {
@@ -71,6 +101,7 @@ func (w *Writer) init() error {
 		return fmt.Errorf("%w: %d is only valid for legacy frames", lz4errors.ErrOptionInvalidBlockSize, lz4block.Block8Mb)
 	}
 	w.frame.InitW(w.src, w.num, w.legacy)
+	w.nwritten = 0
 	size := w.frame.BlockSizeIndex()
 	w.data = size.Get()
 	w.idx = 0
@@ -95,6 +126,13 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 	}
 
 	zn := len(w.data)
+	// Enforce the declared original content size, if any: bytes past the
+	// declared size are rejected immediately rather than only at Close.
+	overrun := 0
+	if allowed, rejected := w.limit(buf); rejected > 0 {
+		buf = allowed
+		overrun = rejected
+	}
 	for len(buf) > 0 {
 		if w.isNotConcurrent() && w.idx == 0 && len(buf) >= zn {
 			// Avoid a copy as there is enough data for a block.
@@ -102,18 +140,20 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 				return
 			}
 			n += zn
+			w.nwritten += uint64(zn)
 			buf = buf[zn:]
 			continue
 		}
 		// Accumulate the data to be compressed.
 		m := copy(w.data[w.idx:], buf)
 		n += m
+		w.nwritten += uint64(m)
 		w.idx += m
 		buf = buf[m:]
 
 		if w.idx < len(w.data) {
 			// Buffer not filled.
-			return
+			break
 		}
 
 		// Buffer full.
@@ -126,8 +166,15 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 		}
 		w.idx = 0
 	}
+	if overrun > 0 && err == nil {
+		err = errContentSizeExceeded
+	}
 	return
 }
+
+// errContentSizeExceeded marks a write that would take in more bytes than the
+// content size declared with SizeOption.
+var errContentSizeExceeded = fmt.Errorf("%w: write exceeds declared content size", lz4errors.ErrInvalidContentSize)
 
 func (w *Writer) write(data []byte, safe bool) error {
 	if w.isNotConcurrent() {
@@ -248,12 +295,23 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 		default:
 			return
 		}
+		// Reject any bytes past the declared content size.
+		overrun := 0
+		if allowed, rejected := w.limit(data[:rn]); rejected > 0 {
+			rn = len(allowed)
+			overrun = rejected
+			done = true
+		}
 		n += int64(rn)
+		w.nwritten += uint64(rn)
 		if rn > 0 {
-			err = w.write(data[:rn], true)
-			if err != nil {
+			if err = w.write(data[:rn], true); err != nil {
 				return
 			}
+		}
+		if overrun > 0 && err == nil {
+			err = errContentSizeExceeded
+			return
 		}
 		if !done && !w.isNotConcurrent() {
 			// The buffer will be returned automatically by go routines (safe=true)
