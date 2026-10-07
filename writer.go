@@ -35,6 +35,7 @@ type Writer struct {
 	frame   *lz4stream.Frame          // frame being built
 	data    []byte                    // pending data
 	idx     int                       // size of pending data
+	written uint64                    // uncompressed bytes accepted so far, checked against SizeOption
 	handler func(int)
 	legacy  bool
 }
@@ -63,6 +64,15 @@ func (w *Writer) isNotConcurrent() bool {
 	return w.num == 1
 }
 
+// declaredSize returns the original content size declared with SizeOption,
+// or 0 when none was declared (unknown length).
+func (w *Writer) declaredSize() uint64 {
+	if w.legacy || !w.frame.Descriptor.Flags.Size() {
+		return 0
+	}
+	return w.frame.Descriptor.ContentSize
+}
+
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
 	if !w.legacy && !w.frame.Descriptor.Flags.BlockSizeIndex().IsValid() {
@@ -82,6 +92,7 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 		return 0, lz4errors.ErrWriterClosed
 	}
 	defer w.state.check(&err)
+	defer func() { w.written += uint64(n) }()
 	switch w.state.state {
 	case writeState:
 	case errorState:
@@ -92,6 +103,18 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 		}
 	default:
 		return 0, w.state.fail()
+	}
+
+	if size := w.declaredSize(); size > 0 && w.written+uint64(len(buf)) > size {
+		// A content size was declared: accept only the bytes that still fit
+		// and reject the overflow straight away instead of waiting for Close.
+		attempted := w.written + uint64(len(buf))
+		buf = buf[:size-w.written]
+		defer func() {
+			if err == nil {
+				err = fmt.Errorf("%w: wrote %d; expected %d", lz4errors.ErrInvalidContentSize, attempted, size)
+			}
+		}()
 	}
 
 	zn := len(w.data)
@@ -209,6 +232,7 @@ func (w *Writer) Close() error {
 func (w *Writer) Reset(writer io.Writer) {
 	lz4block.Put(w.data)
 	w.data = nil
+	w.written = 0
 	w.frame.Reset(w.num)
 	w.state.reset()
 	w.src = writer
@@ -231,6 +255,7 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 	defer w.state.check(&err)
 
 	size := w.frame.BlockSizeIndex()
+	declared := w.declaredSize()
 	var done bool
 	var rn int
 	data := size.Get()
@@ -239,7 +264,14 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 		defer lz4block.Put(data)
 	}
 	for !done {
-		rn, err = io.ReadFull(r, data)
+		readBuf := data
+		if declared > 0 {
+			if remaining := declared - w.written; uint64(len(readBuf)) > remaining {
+				// Never read more uncompressed data than SizeOption allows.
+				readBuf = readBuf[:remaining]
+			}
+		}
+		rn, err = io.ReadFull(r, readBuf)
 		switch err {
 		case nil:
 		case io.EOF, io.ErrUnexpectedEOF: // read may be partial
@@ -252,6 +284,24 @@ func (w *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 		if rn > 0 {
 			err = w.write(data[:rn], true)
 			if err != nil {
+				return
+			}
+			w.written += uint64(rn)
+		}
+		if !done && declared > 0 && w.written >= declared {
+			// The declared amount is written, but the source has not ended:
+			// reject the overflow immediately rather than waiting for Close.
+			var probe [1]byte
+			var pn int
+			pn, err = r.Read(probe[:])
+			switch {
+			case pn > 0 || err == nil:
+				err = fmt.Errorf("%w: wrote %d; expected %d", lz4errors.ErrInvalidContentSize, w.written+uint64(pn), declared)
+				return
+			case err == io.EOF || err == io.ErrUnexpectedEOF:
+				err = nil
+				done = true
+			default:
 				return
 			}
 		}

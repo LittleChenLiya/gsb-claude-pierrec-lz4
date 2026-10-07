@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -703,4 +705,208 @@ func TestWriterSizeOption(t *testing.T) {
 			})
 		}
 	}
+}
+
+// errSink is a sentinel failure returned by failing destination writers;
+// it must always take precedence over the declared-content-size error.
+var errSink = errors.New("sink writer failure")
+
+// failWriter accepts writes until fail is set, then rejects every one.
+type failWriter struct {
+	buf  bytes.Buffer
+	fail bool
+}
+
+func (f *failWriter) Write(p []byte) (int, error) {
+	if f.fail {
+		return 0, errSink
+	}
+	return f.buf.Write(p)
+}
+
+// TestWriterSizeOptionContract pins down the LZ4 writer content size
+// convention around a declared length of 3 bytes:
+//   - writing exactly the declared amount round-trips through the Reader;
+//   - writing less fails with ErrInvalidContentSize at Close;
+//   - writing more is rejected as soon as the overflow is presented, and the
+//     accepted byte count matches the declaration;
+//   - an error from the underlying writer takes precedence over the content
+//     size error;
+//   - with no declared size, behaviour is unchanged.
+func TestWriterSizeOptionContract(t *testing.T) {
+	payload := []byte("abc")
+
+	for _, tc := range []struct {
+		name  string
+		write func(zw *lz4.Writer) (int, error)
+		n     int   // bytes the first write must report as accepted
+		wErr  error // error expected from Write/ReadFrom
+		cErr  error // error expected from Close
+	}{
+		{
+			name:  "exact",
+			write: func(zw *lz4.Writer) (int, error) { n, err := zw.Write(payload); return n, err },
+			n:     3,
+		},
+		{
+			name:  "short",
+			write: func(zw *lz4.Writer) (int, error) { n, err := zw.Write(payload[:2]); return n, err },
+			n:     2,
+			cErr:  lz4.ErrInvalidContentSize,
+		},
+		{
+			name: "overflow",
+			write: func(zw *lz4.Writer) (int, error) {
+				n, err := zw.Write(append(append([]byte{}, payload...), 'd'))
+				return n, err
+			},
+			n:    3,
+			wErr: lz4.ErrInvalidContentSize,
+			cErr: lz4.ErrInvalidContentSize,
+		},
+		{
+			name: "overflowSplit",
+			write: func(zw *lz4.Writer) (int, error) {
+				if n, err := zw.Write(payload[:2]); err != nil {
+					return n, err
+				}
+				return zw.Write([]byte("cd")) // only one byte still fits
+			},
+			n:    1,
+			wErr: lz4.ErrInvalidContentSize,
+			cErr: lz4.ErrInvalidContentSize,
+		},
+		{
+			name:  "readFromExact",
+			write: func(zw *lz4.Writer) (int, error) { n, err := zw.ReadFrom(bytes.NewReader(payload)); return int(n), err },
+			n:     3,
+		},
+		{
+			name: "readFromShort",
+			write: func(zw *lz4.Writer) (int, error) {
+				n, err := zw.ReadFrom(bytes.NewReader(payload[:2]))
+				return int(n), err
+			},
+			n:    2,
+			cErr: lz4.ErrInvalidContentSize,
+		},
+		{
+			name: "readFromOverflow",
+			write: func(zw *lz4.Writer) (int, error) {
+				n, err := zw.ReadFrom(bytes.NewReader(append(append([]byte{}, payload...), 'd')))
+				return int(n), err
+			},
+			n:    3,
+			wErr: lz4.ErrInvalidContentSize,
+			cErr: lz4.ErrInvalidContentSize,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			zw := lz4.NewWriter(&buf)
+			if err := zw.Apply(lz4.SizeOption(3)); err != nil {
+				t.Fatal(err)
+			}
+			n, err := tc.write(zw)
+			if !errors.Is(err, tc.wErr) {
+				t.Fatalf("write error = %v, want %v", err, tc.wErr)
+			}
+			if n != tc.n {
+				t.Fatalf("accepted %d bytes, want %d", n, tc.n)
+			}
+			if err = zw.Close(); !errors.Is(err, tc.cErr) {
+				t.Fatalf("Close error = %v, want %v", err, tc.cErr)
+			}
+			if tc.wErr != nil || tc.cErr != nil {
+				return
+			}
+			// The successful frames must decode back to the original bytes.
+			out, err := io.ReadAll(lz4.NewReader(&buf))
+			if err != nil || !bytes.Equal(out, payload) {
+				t.Fatalf("round trip = %q (%v), want %q", out, err, payload)
+			}
+		})
+	}
+
+	// An output failure must not be hidden by the declared size mismatch.
+	t.Run("outputFailsAtHeader", func(t *testing.T) {
+		dst := &failWriter{fail: true}
+		zw := lz4.NewWriter(dst)
+		if err := zw.Apply(lz4.SizeOption(3)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := zw.Write(payload); !errors.Is(err, errSink) {
+			t.Fatalf("Write error = %v, want underlying %v", err, errSink)
+		}
+	})
+	t.Run("outputFailsAtFlush", func(t *testing.T) {
+		dst := &failWriter{}
+		zw := lz4.NewWriter(dst)
+		if err := zw.Apply(lz4.SizeOption(3), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := zw.Write(payload[:2]); err != nil { // short on purpose
+			t.Fatal(err)
+		}
+		dst.fail = true // Flush/Close hits the broken destination writer
+		if err := zw.Close(); !errors.Is(err, errSink) {
+			t.Fatalf("Close error = %v, want underlying %v over the content size error", err, errSink)
+		}
+	})
+
+	// No declared size: the length stays unknown and everything is accepted.
+	t.Run("unknownSizeUnchanged", func(t *testing.T) {
+		var buf bytes.Buffer
+		zw := lz4.NewWriter(&buf)
+		big := bytes.Repeat([]byte("x"), 10)
+		if n, err := zw.Write(big); err != nil || n != len(big) {
+			t.Fatalf("Write = %d,%v, want %d,nil", n, err, len(big))
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+}
+
+// TestWriterSizeOptionTempFile demonstrates the 3-byte declared-size round
+// trip with a small temporary-file fixture: write a frame with SizeOption(3),
+// then restore the original content with the existing Reader.
+func TestWriterSizeOptionTempFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "frame.lz4")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := lz4.NewWriter(f)
+	if err := zw.Apply(lz4.SizeOption(uint64(len("abc")))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := zw.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	g, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	out, err := io.ReadAll(lz4.NewReader(g))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "abc" {
+		t.Fatalf("file round trip = %q, want abc", out)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("compressed 3 bytes into a %d-byte frame at %s", st.Size(), path)
 }
