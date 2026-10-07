@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -526,6 +528,127 @@ func TestReaderErrorIsSticky(t *testing.T) {
 			})
 		}
 	}
+}
+
+// frameWithBlockChecksum builds a small single-block frame with the block
+// checksum enabled, optionally corrupting the block checksum.
+func frameWithBlockChecksum(t testing.TB, data []byte, corrupt bool) []byte {
+	t.Helper()
+	comp := compressBlock(t, data)
+	ck := xxh32.ChecksumZero(comp)
+	if corrupt {
+		ck ^= 1
+	}
+	return cat(magic, desc(flgV1|flgIndep|flgBlkCk, bd64K), compBlock(comp), le32(ck), endMark)
+}
+
+// TestReaderBlockChecksumPosition checks the position context attached to a
+// block checksum failure: frame number, block number and compressed offset.
+// The stream is two small frames with a skippable frame in between, and the
+// second frame's (only) block checksum is corrupted. Skippable frames are
+// skipped but still count towards the compressed offset.
+func TestReaderBlockChecksumPosition(t *testing.T) {
+	hello := []byte("hello, hello, hello, hello, hello, hello!")
+	frame1 := frameWithBlockChecksum(t, hello, false)
+	skip := skippable(2, []byte("skipped bytes"))
+	frame2 := frameWithBlockChecksum(t, hello, true)
+	in := cat(frame1, skip, frame2)
+	// The checksum fails while verifying the block, before the frame end
+	// mark is read: the offset is the position right past the bad block and
+	// its checksum.
+	wantOffset := int64(len(frame1) + len(skip) + len(frame2) - len(endMark))
+
+	for _, m := range []decodeMode{
+		{"Read", 1, 7},
+		{"Read/direct", 1, 4<<20 + 1},
+		{"WriteTo", 1, 0},
+	} {
+		t.Run(m.name, func(t *testing.T) {
+			out, err := decodeWith(m, in)
+			if !errors.Is(err, lz4.ErrInvalidBlockChecksum) {
+				t.Fatalf("err = %v, want errors.Is ErrInvalidBlockChecksum", err)
+			}
+			// The valid first frame is fully decoded before the failure.
+			if !bytes.Equal(out, hello) {
+				t.Fatalf("output = %q, want first frame %q", out, hello)
+			}
+			var bce *lz4.BlockChecksumError
+			if !errors.As(err, &bce) {
+				t.Fatalf("err %v is not *BlockChecksumError", err)
+			}
+			if bce.Frame != 2 || bce.Block != 1 || bce.CompressedOffset != wantOffset {
+				t.Fatalf("position = frame %d block %d offset %d; want frame 2 block 1 offset %d",
+					bce.Frame, bce.Block, bce.CompressedOffset, wantOffset)
+			}
+			t.Logf("%s", bce)
+		})
+	}
+
+	// A corrupted first frame reports the position from the start.
+	t.Run("firstFrame", func(t *testing.T) {
+		bad := frameWithBlockChecksum(t, hello, true)
+		_, err := decodeWith(decodeModes[0], bad)
+		var bce *lz4.BlockChecksumError
+		if !errors.As(err, &bce) {
+			t.Fatalf("err %v is not *BlockChecksumError", err)
+		}
+		if bce.Frame != 1 || bce.Block != 1 || bce.CompressedOffset != int64(len(bad)-len(endMark)) {
+			t.Fatalf("position = frame %d block %d offset %d; want frame 1 block 1 offset %d",
+				bce.Frame, bce.Block, bce.CompressedOffset, len(bad)-len(endMark))
+		}
+	})
+
+	// Reset clears the position: the same corruption on the new stream is
+	// frame 1, offset measured from the new stream only.
+	t.Run("afterReset", func(t *testing.T) {
+		zr := lz4.NewReader(bytes.NewReader(in))
+		if _, err := io.Copy(io.Discard, zr); !errors.Is(err, lz4.ErrInvalidBlockChecksum) {
+			t.Fatalf("first stream: err = %v", err)
+		}
+		bad := frameWithBlockChecksum(t, hello, true)
+		zr.Reset(bytes.NewReader(bad))
+		_, err := io.Copy(io.Discard, zr)
+		var bce *lz4.BlockChecksumError
+		if !errors.As(err, &bce) {
+			t.Fatalf("after Reset: err %v is not *BlockChecksumError", err)
+		}
+		if bce.Frame != 1 || bce.Block != 1 || bce.CompressedOffset != int64(len(bad)-len(endMark)) {
+			t.Fatalf("after Reset position = frame %d block %d offset %d; want frame 1 block 1 offset %d",
+				bce.Frame, bce.Block, bce.CompressedOffset, len(bad)-len(endMark))
+		}
+
+		// A valid stream after a Reset reads from the new stream too.
+		good := frameWithBlockChecksum(t, hello, false)
+		zr.Reset(bytes.NewReader(good))
+		out, err := io.ReadAll(zr)
+		if err != nil || !bytes.Equal(out, hello) {
+			t.Fatalf("valid stream after Reset: out=%q err=%v", out, err)
+		}
+	})
+
+	// Same layout stored in a small temp file: the position reported through
+	// an *os.File source is identical to the in-memory source.
+	t.Run("tempFile", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "corrupt.lz4")
+		if err := os.WriteFile(path, in, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		zr := lz4.NewReader(f)
+		_, err = io.Copy(io.Discard, zr)
+		var bce *lz4.BlockChecksumError
+		if !errors.As(err, &bce) {
+			t.Fatalf("err %v is not *BlockChecksumError", err)
+		}
+		if bce.Frame != 2 || bce.Block != 1 || bce.CompressedOffset != wantOffset {
+			t.Fatalf("position = frame %d block %d offset %d; want frame 2 block 1 offset %d",
+				bce.Frame, bce.Block, bce.CompressedOffset, wantOffset)
+		}
+	})
 }
 
 func TestOptionErrors(t *testing.T) {

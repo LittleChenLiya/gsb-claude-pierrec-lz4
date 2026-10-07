@@ -2,7 +2,10 @@ package lz4
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
+	"strings"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -32,16 +35,33 @@ func newReader(r io.Reader, legacy bool) *Reader {
 
 // Reader allows reading an LZ4 stream.
 type Reader struct {
-	state   _State
-	src     io.Reader        // source reader
-	num     int              // concurrency level
-	frame   *lz4stream.Frame // frame being read
-	data    []byte           // block buffer allocated in non-concurrent mode
-	reads   chan []byte      // pending data
-	idx     int              // size of pending data
-	handler func(int)
-	cum     uint32
-	dict    []byte
+	state    _State
+	src      io.Reader        // source reader
+	count    *countingReader  // wraps src and counts compressed bytes consumed
+	num      int              // concurrency level
+	frame    *lz4stream.Frame // frame being read
+	data     []byte           // block buffer allocated in non-concurrent mode
+	reads    chan []byte      // pending data
+	idx      int              // size of pending data
+	handler  func(int)
+	cum      uint32
+	dict     []byte
+	frameNum int // 1-based number of the frame being read, counting LZ4 frames only
+	blockNum int // 1-based number of the block being read within the current frame
+}
+
+// countingReader records the number of compressed bytes consumed from the
+// underlying reader. Skippable frames are read through it like any other
+// bytes, so they count towards the compressed offset.
+type countingReader struct {
+	r      io.Reader
+	offset int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.offset += int64(n)
+	return n, err
 }
 
 func (*Reader) private() {}
@@ -97,6 +117,8 @@ func (r *Reader) init() error {
 	size := r.frame.BlockSizeIndex()
 	r.data = size.Get()
 	r.cum = 0
+	r.frameNum++
+	r.blockNum = 0
 	return nil
 }
 
@@ -139,7 +161,7 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 				}
 
 				// Check for a new stream.
-				r.Reset(r.src)
+				r.nextFrame()
 				if err = r.init(); r.state.next(err) {
 					return
 				}
@@ -195,8 +217,17 @@ func (r *Reader) read(buf []byte) (int, error) {
 		// more than the frame's block size is rejected as it is otherwise.
 		dst = buf[:len(dst)]
 	}
+	r.blockNum++
 	dst, err = block.Uncompress(r.frame, dst, r.dict, true)
 	if err != nil {
+		if errors.Is(err, lz4errors.ErrInvalidBlockChecksum) {
+			return 0, &BlockChecksumError{
+				Frame:            r.frameNum,
+				Block:            r.blockNum,
+				CompressedOffset: r.count.offset,
+				Err:              err,
+			}
+		}
 		return 0, err
 	}
 	if !r.frame.Descriptor.Flags.BlockIndependence() {
@@ -218,14 +249,57 @@ func (r *Reader) read(buf []byte) (int, error) {
 // Reset clears the state of the Reader r such that it is equivalent to its
 // initial state from NewReader, but instead reading from reader.
 // No access to reader is performed.
+// The frame, block and compressed-offset positions start over at zero: the
+// new stream is measured independently of the previous one.
 func (r *Reader) Reset(reader io.Reader) {
 	lz4block.Put(r.data)
 	r.data = nil
 	r.frame.Reset(r.num)
 	r.state.reset()
-	r.src = reader
+	r.count = &countingReader{r: reader}
+	r.src = r.count
 	r.reads = nil
+	r.frameNum = 0
+	r.blockNum = 0
 }
+
+// nextFrame prepares the Reader for the next frame of a concatenated stream
+// on the same source. Unlike Reset, the compressed offset keeps accruing and
+// the new frame takes the next frame number. Skippable frames skipped while
+// parsing headers stay counted in the compressed offset.
+func (r *Reader) nextFrame() {
+	lz4block.Put(r.data)
+	r.data = nil
+	r.frame.Reset(r.num)
+	r.state.reset()
+	r.reads = nil
+	r.blockNum = 0
+}
+
+// BlockChecksumError wraps an ErrInvalidBlockChecksum with the position of
+// the corrupted block in the compressed stream.
+type BlockChecksumError struct {
+	// Frame is the 1-based number of the frame containing the bad block.
+	// Skippable frames are not counted.
+	Frame int
+	// Block is the 1-based number of the bad block within its frame.
+	Block int
+	// CompressedOffset is the number of compressed bytes consumed from the
+	// source when the checksum failure is detected: the position just past
+	// the bad block including its checksum, before the frame end mark is
+	// read. Skippable frames count.
+	CompressedOffset int64
+	// Err is the underlying error; errors.Is(err, ErrInvalidBlockChecksum)
+	// keeps matching.
+	Err error
+}
+
+func (e *BlockChecksumError) Error() string {
+	detail := strings.TrimPrefix(e.Err.Error(), lz4errors.ErrInvalidBlockChecksum.Error())
+	return fmt.Sprintf("%s at frame %d block %d compressed offset %d%s", lz4errors.ErrInvalidBlockChecksum, e.Frame, e.Block, e.CompressedOffset, detail)
+}
+
+func (e *BlockChecksumError) Unwrap() error { return e.Err }
 
 // WriteTo efficiently uncompresses the data from the Reader underlying source to w.
 func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
@@ -286,7 +360,7 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 				return
 			}
 			// Check for a new stream.
-			r.Reset(r.src)
+			r.nextFrame()
 			if err = r.init(); r.state.next(err) {
 				if err == io.EOF {
 					err = nil
