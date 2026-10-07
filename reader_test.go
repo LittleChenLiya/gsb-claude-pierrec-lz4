@@ -157,6 +157,53 @@ func TestReader_Reset(t *testing.T) {
 	}
 }
 
+// Block checksum failures report the frame, block and compressed offset of
+// the bad block, and keep the underlying checksum error identity.
+func TestReaderBlockChecksumError(t *testing.T) {
+	hello := []byte("hello, hello, hello, hello, hello, hello!")
+	comp := compressBlock(t, hello)
+	hdr := cat(magic, desc(flgV1|flgIndep|flgBlkCk, bd64K))
+
+	badChecksum := xxh(comp)
+	badChecksum[0] ^= 1 // corrupt the block checksum
+
+	frame1 := cat(hdr, compBlock(comp), xxh(comp), endMark)
+	skip := skippable(0, []byte("skip me"))
+	frame2 := cat(hdr, compBlock(comp), badChecksum, endMark)
+	stream := cat(frame1, skip, frame2)
+
+	// The bad block is the first block of the second frame; its compressed
+	// offset includes the first frame and the skipped frame.
+	wantOffset := int64(len(frame1) + len(skip) + len(hdr))
+
+	check := func(t *testing.T, zr *lz4.Reader, want []byte, frame, block int, offset int64) {
+		t.Helper()
+		out, err := io.ReadAll(zr)
+		if !bytes.Equal(out, want) {
+			t.Fatalf("got output %q, want %q", out, want)
+		}
+		if !errors.Is(err, lz4.ErrInvalidBlockChecksum) {
+			t.Fatalf("got error %v, want %v", err, lz4.ErrInvalidBlockChecksum)
+		}
+		var bce *lz4.BlockChecksumError
+		if !errors.As(err, &bce) {
+			t.Fatalf("error %v (%T) is not a BlockChecksumError", err, err)
+		}
+		if bce.Frame != frame || bce.Block != block || bce.Offset != offset {
+			t.Fatalf("got frame %d, block %d, offset %d; want frame %d, block %d, offset %d",
+				bce.Frame, bce.Block, bce.Offset, frame, block, offset)
+		}
+		t.Logf("error: %v", err)
+	}
+
+	zr := lz4.NewReader(bytes.NewReader(stream))
+	check(t, zr, hello, 1, 0, wantOffset)
+
+	// After Reset, positions are computed from the new stream.
+	zr.Reset(bytes.NewReader(cat(hdr, compBlock(comp), badChecksum, endMark)))
+	check(t, zr, nil, 0, 0, int64(len(hdr)))
+}
+
 func TestReader_Append(t *testing.T) {
 	data := randomAppendedLZ4
 
